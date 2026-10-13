@@ -1,0 +1,135 @@
+# A browsable self-hosted Lago. The Go test starts its own throwaway stack in
+# container.go; this one is for clicking around the UI and keeping data between
+# restarts.
+#
+# Two services here that the test deliberately omits:
+#   clock - Lago's scheduler. Without it nothing bills at period rollover, which
+#           the test does not need because it terminates a subscription instead.
+#   front - the web UI, pointless to a headless test and the whole point here.
+name: go-bill-lago
+
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?search_path=public
+  REDIS_URL: redis://redis:6379
+  LAGO_REDIS_CACHE_URL: redis://redis:6379
+
+  RAILS_ENV: production
+  RAILS_LOG_TO_STDOUT: "true"
+
+  SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+  LAGO_RSA_PRIVATE_KEY: ${LAGO_RSA_PRIVATE_KEY}
+  LAGO_ENCRYPTION_PRIMARY_KEY: ${LAGO_ENCRYPTION_PRIMARY_KEY}
+  LAGO_ENCRYPTION_DETERMINISTIC_KEY: ${LAGO_ENCRYPTION_DETERMINISTIC_KEY}
+  LAGO_ENCRYPTION_KEY_DERIVATION_SALT: ${LAGO_ENCRYPTION_KEY_DERIVATION_SALT}
+
+  LAGO_API_URL: http://localhost:${LAGO_API_PORT}
+  LAGO_FRONT_URL: http://localhost:${LAGO_FRONT_PORT}
+
+  # No gotenberg service, so invoice PDF rendering has to be off.
+  LAGO_DISABLE_PDF_GENERATION: "true"
+  LAGO_DISABLE_SEGMENT: "true"
+  # Sidekiq's dashboard, handy here and switched off in the test.
+  LAGO_SIDEKIQ_WEB: "true"
+
+  # Seeds the organization and pins its API key to a known value, so the same
+  # credentials work in the UI and from Go. All four are mandatory together.
+  LAGO_CREATE_ORG: "true"
+  LAGO_ORG_NAME: ${LAGO_ORG_NAME}
+  LAGO_ORG_USER_EMAIL: ${LAGO_ORG_USER_EMAIL}
+  LAGO_ORG_USER_PASSWORD: ${LAGO_ORG_USER_PASSWORD}
+  LAGO_ORG_API_KEY: ${LAGO_ORG_API_KEY}
+
+services:
+  db:
+    # Upstream's Postgres, not a stock one: db/structure.sql does an unguarded
+    # CREATE EXTENSION pg_partman, so plain postgres:17 fails to migrate.
+    image: getlago/postgres-partman:15.0-alpine
+    environment:
+      # POSTGRES_USER is created as a superuser, which Lago's CREATE EXTENSION
+      # migrations require.
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - lago_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - lago_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    image: getlago/api:v1.55.0
+    # No command override on purpose. The image's default CMD is
+    # scripts/start.sh, which migrates, seeds the roles, seeds the organization
+    # and only then serves - so this one service covers all of it, and a healthy
+    # /health means the API key below already works.
+    environment: *backend-env
+    ports:
+      - "${LAGO_API_PORT}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"]
+      interval: 10s
+      timeout: 60s
+      retries: 10
+      # Migrations run before the server binds, so give it room before the first
+      # check counts against the retry budget.
+      start_period: 60s
+
+  worker:
+    image: getlago/api:v1.55.0
+    # Sidekiq. Lago builds invoices in background jobs, so without this nothing
+    # ever gets billed, however much usage you report.
+    command: ["./scripts/start.worker.sh"]
+    environment: *backend-env
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  clock:
+    image: getlago/api:v1.55.0
+    # Scheduler: activates pending subscriptions, refreshes draft invoices and
+    # bills subscriptions when their period rolls over.
+    command: ["./scripts/start.clock.sh"]
+    environment: *backend-env
+    depends_on:
+      api:
+        condition: service_healthy
+
+  front:
+    image: getlago/front:v1.55.0
+    environment:
+      # Read by the browser, so it has to be the host address, not http://api.
+      API_URL: http://localhost:${LAGO_API_PORT}
+      APP_ENV: production
+      LAGO_DISABLE_PDF_GENERATION: "true"
+    ports:
+      - "${LAGO_FRONT_PORT}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  lago_postgres:
+  lago_redis:
