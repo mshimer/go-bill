@@ -3,7 +3,7 @@
 A mock HTTP server for Go tests. Register matchers against responses, point the
 code under test at a real `127.0.0.1` socket, then assert on what it sent.
 
-Stdlib only - no dependencies. Ported from the Kotlin `dim-mak` library.
+Stdlib only - no dependencies.
 
 Directory is `mock-h/`; the Go package name is `mockh` (identifiers cannot
 contain hyphens).
